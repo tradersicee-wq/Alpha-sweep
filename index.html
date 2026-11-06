@@ -1,5 +1,116 @@
-python-telegram-bot==21.1.1
-stripe==8.5.0
-flask==3.0.2
-python-dotenv==1.0.1
-requests==2.31.0
+import os
+from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+import stripe
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, Update
+
+# Load configuration from the local, hidden .env file
+load_dotenv()
+
+# --- CONFIGURATION (Pulled Safely from Environment Variables) ---
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID")
+
+# Convert the Channel ID string to an integer safely
+try:
+    PRIVATE_CHANNEL_ID = int(os.getenv("PRIVATE_CHANNEL_ID", "0"))
+except ValueError:
+    raise ValueError("PRIVATE_CHANNEL_ID in your .env file must be a valid number starting with -100")
+
+# Initialize SDKs
+stripe.api_key = STRIPE_SECRET_KEY
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+app = Flask(__name__)
+
+# --- TELEGRAM BOT LOGIC ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Greets the user and provides the premium subscription checkout link."""
+    user_id = update.effective_user.id
+    
+    # Create a Stripe Checkout Session for this specific Telegram User
+    session = stripe.checkout.Session.create(
+        payment_method_types=['card'],
+        line_items=[{'price': STRIPE_PRICE_ID, 'quantity': 1}],
+        mode='subscription',
+        success_url='https://t.me',  # Redirect back to bot after success
+        cancel_url='https://t.me',
+        metadata={'telegram_user_id': str(user_id)}  # Map payment to user ID
+    )
+    
+    keyboard = [[InlineKeyboardButton("💳 Subscribe for $200/Month", url=session.url)]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    welcome_text = (
+        "👋 Welcome to Neural FX Bot Premium Academy!\n\n"
+        "Unlock ultimate market edge:\n"
+        "📈 Daily Trading Signals\n"
+        "📚 Lessons: Trendlines, SMS, Liquidity\n"
+        "💬 Direct chat access\n\n"
+        "Click below to start your premium subscription membership:"
+    )
+    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+
+# --- STRIPE WEBHOOK SERVER LOGIC ---
+@app.route('/webhook', methods=['POST'])
+def stripe_webhook():
+    """Listens for Stripe events to dynamically grant or revoke access."""
+    payload = request.data
+    sig_header = request.headers.get('HTTP_STRIPE_SIGNATURE')
+    event = None
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+    # Handle successful subscription payment
+    if event['type'] == 'checkout.session.completed':
+        session = event['data']['object']
+        telegram_user_id = session['metadata'].get('telegram_user_id')
+        
+        if telegram_user_id:
+            # Generate a secure, single-use invite link valid for 1 user
+            invite_link = bot.create_chat_invite_link(
+                chat_id=PRIVATE_CHANNEL_ID,
+                member_limit=1
+            )
+            
+            # Message the user with their access details
+            bot.send_message(
+                chat_id=telegram_user_id,
+                text=(
+                    "✅ Payment Confirmed! Welcome to the inner circle.\n\n"
+                    f"🔗 Click here to join your Private Signal Channel: {invite_link.invite_link}\n\n"
+                    "Note: This link is unique and will expire after one use."
+                )
+            )
+
+    # Handle subscription cancellations or failed payments
+    elif event['type'] in ['customer.subscription.deleted', 'invoice.payment_failed']:
+        subscription = event['data']['object']
+        customer = stripe.Customer.retrieve(subscription['customer'])
+        telegram_user_id = customer.metadata.get('telegram_user_id')
+        
+        if telegram_user_id:
+            try:
+                bot.ban_chat_member(chat_id=PRIVATE_CHANNEL_ID, user_id=telegram_user_id)
+                bot.unban_chat_member(chat_id=PRIVATE_CHANNEL_ID, user_id=telegram_user_id)  # Clean state
+                bot.send_message(chat_id=telegram_user_id, text="❌ Your premium subscription has ended. Access revoked.")
+            except Exception as e:
+                print(f"Error revoking access: {e}")
+
+    return jsonify({'status': 'success'}), 200
+
+def run_bot():
+    """Initializes the Telegram Bot."""
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.run_polling()
+
+if __name__ == '__main__':
+    import threading
+    threading.Thread(target=run_bot).start()
+    app.run(port=5000)
